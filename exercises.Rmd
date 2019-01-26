@@ -1,0 +1,171 @@
+---
+title: "Polynomial regression using the tidymodels framework"
+author: "Charlie Stone"
+date: "26/01/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## 0. Setup
+
+Load packages and set seed.
+```{r message = FALSE}
+library(ISLR)
+library(tidyverse)
+library(tidymodels)
+library(parsnip)
+library(dials)
+library(plotly)
+```
+
+
+## Ex 6 Wage data
+
+### Wage data summary
+
+
+```{r 6_eda}
+wage_df <- as_tibble(Wage)
+
+wage_df[1:10, ]
+
+wage_df %>%
+  select_if(~!is_double(.))%>%
+  map(unique)
+```
+
+### Polynomial regression
+
+**Simple tidymodels example**
+
+Fitting the model wage ~ poly(age, 3).  Centering age is not neccessary and makes no difference, but done anyway to illustrate how done in tidymodels framework
+```{r 6_tidymodels}
+# 1. Use rsample package to split data into training set and test set.
+set.seed(23)
+split <- initial_split(wage_df, prop = 0.8)
+train_data <- training(split)
+test_data <- testing(split)
+
+# 2. Use recipes package to carry out pre-processing.
+# 2.a Specify recipe.  It is important to split the data before using prep() and bake(), because if not, you will use observations from the test set in the prep() step, and thus introduce knowledge from the test set into the training data. 
+rec <- train_data %>% 
+  recipe(wage ~ age) %>% 
+  step_center(all_predictors())
+
+# 2.b Prepping. This estimates the required quantities and statistics used in any later operations (eg calculating means of variables to rescale means to 0)
+prepped <- 
+  rec %>% 
+  prep(retain = TRUE)
+
+# 2.c Baking. This takes the trained recipe and applies it to the train and test datasets. Note that the means for scaling calculated in the function prep are used to scale all later datasets (can see this as mean of test$age is not equal to zero).  As the train_data is used to specify the recipe, the means of the train_data are used to center all predictors.
+train <- 
+  prepped %>% 
+  juice()
+
+test <- 
+  prepped %>% 
+  bake(new_data = test_data)
+
+# 3. Use parsnip package to train model
+# 3.a Model specification
+lin_mod <- linear_reg() %>%
+   set_engine("lm")
+
+# 3.b Train model
+fitted_mod <- lin_mod %>%
+  fit(wage ~ poly(age, 3), data = train)
+
+# 4. Add predictions to test data and estimate rmse (root mean square error) using yardstick.
+# 4.1 Add predictions
+test <- test %>%
+  bind_cols(predict(fitted_mod, test))
+
+# 4.2 Calculate rmse of predicted values of wage and actual values of wage for test dataset.
+test %>% 
+  rmse(wage, .pred)
+
+# 5. Plot fitted values and actual values on chart.
+ggplot(test, aes(age, wage)) +
+  geom_point() +
+  geom_line(aes(age, .pred), colour = "red", size = 2)
+```
+
+**Cross validation to estimate the degree of the polynomial which best fits the data**
+
+This shows that d = 4 provides the best model out of d = 1:10.  However, very little difference between modeld with d = 3 and d = 4, so choose d = 3 on the basis that it is simpler.
+
+Thhe cross validation estimates of rmse for models with different degree polynomials could be found much more quicky, and in fewer lines of code using the cv.glm() function from the boot package.  However, the code below could be easily adapted to add further pre-processing steps to the data, models other than glms, different model engines, and different model assessment metrics (currently use rmse).
+
+```{r 6_poly_cross_val}
+# 1. Use rsample package to split data into training set and test set.
+set.seed(23)
+split <- initial_split(wage_df, prop = 0.8)
+train_data <- training(split)
+test_data <- testing(split)
+
+# 2. Use recipes package to carry out pre-processing.
+# 2.a Specify recipe.  It is important to split the data before using prep() and bake(), because if not, you will use observations from the test set in the prep() step, and thus introduce knowledge from the test set into the training data. 
+rec <- train_data %>% 
+  recipe(wage ~ age) %>% 
+  step_center(all_predictors())
+
+# 3 Fit model to train data.
+
+# 3.a Model specification
+lin_mod <- linear_reg() %>%
+   set_engine("lm")
+
+# 3.b Function to fit a model to each hold out sample for each of 10 folds, with model being polynomial of degree d.
+
+calc_cv_rmse <- function(d){
+set.seed(23) # Set seed here to ensure that the same folds are used for each value of d.
+folds <- vfold_cv(train_data, v = 10)
+
+folded <- 
+  folds %>% 
+  mutate(
+    recipes = splits %>% map(prepper, recipe = rec), 
+    # Prepper is a wrapper for `prep()` which handles `split` objects
+    analysis_data = splits %>% map(analysis),
+    analysis_data = map2(recipes, analysis_data, bake),
+    poly_model = map(analysis_data, ~ fit(lin_mod, wage ~ poly(age, d), data = .x))
+  )
+
+# Predict wage for assessment dataset and calculate rmse vs actual wage values for each fold 
+folded <- folded %>%
+  mutate(
+    assessment_data = splits %>% map(assessment),
+    assessment_data = map2(recipes, assessment_data, bake),
+    wage_pred = map2(poly_model, assessment_data, predict),
+    assessment_data = map2(assessment_data, wage_pred, bind_cols),
+    rmse = map_dbl(assessment_data, function (df) rmse(df, wage, .pred)$.estimate)
+  )
+
+# Calculate mean rmse across all folds
+rmse <- folded %>%
+  select(rmse) %>%
+  summarise(rmse = mean(rmse)) %>%
+  unlist()
+
+return(rmse)
+}
+
+# 3.c Calculate rmse for each value of d from 1 to 10
+d_rmse <- tibble(d = 1:10) %>%
+  mutate(rmse = map_dbl(d, calc_cv_rmse))
+
+d_rmse
+
+plot_d_rmse <- ggplot(d_rmse, aes(d, rmse)) +
+  geom_point() +
+  geom_line()
+
+ggplotly(plot_d_rmse)
+
+```
+
+
+
